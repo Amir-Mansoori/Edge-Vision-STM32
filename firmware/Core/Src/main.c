@@ -64,15 +64,21 @@ static void MX_USB_OTG_FS_PCD_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* One-byte receive buffer for the interrupt-driven UART RX. */
 uint8_t rx_buffer[2];
 uint8_t *rx_message = &rx_buffer[0];
+
+/* Command decoded from the UART: set in the RX interrupt, handled in the main loop. */
 typedef enum command{
 	flag_Idle,
 	flag_ON,
 	flag_OFF,
 	flag_ERROR
 } command;
-command LED_command = flag_Idle;
+
+/* it should be declared volatile: "volatile command LED_command = flag_Idle;". Otherwise the
+ * compiler may keep it in a register and the main loop could miss the change. */
+volatile command LED_command = flag_Idle;
 // volatile bool flag_ON,flag_ERROR = false;
 /* USER CODE END 0 */
 
@@ -113,12 +119,13 @@ int main(void)
   MX_USB_OTG_FS_PCD_Init();
   MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
+  /* Must come after MX_LWIP_Init(): it creates a PCB, which needs lwIP running. */
   ping_init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-
+  /* Texts sent back to the PC app over UART3. */
    const uint8_t message_dma[] = "DMA LED1 is OFF\r\n";
    const uint8_t message_OFF[] = "LED is OFF\r\n";
    const uint8_t message_Flag_ON[] = "LED1 is ON\r\n";
@@ -126,7 +133,8 @@ int main(void)
    const uint8_t message_Flag_ERROR[] = "Wrong command!\r\n";
 
    HAL_StatusTypeDef status;
-
+   
+   /* Arm the first 1-byte UART receive. The RX-complete callback re-arms it after each byte. */
    status = HAL_UART_Receive_IT(&huart3,rx_message, 1);
        if (status == HAL_ERROR) {
    		  Error_Handler();
@@ -134,21 +142,25 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-
+    /* Keep these two non-blocking and calling often: MX_LWIP_Process() moves received
+    *  frames into the stack (and therefore calls ping_recv()) and runs lwIP's timers;
+    *  ping_poll() sends the periodic ping and reports timeouts. Long blocking calls
+    *  in this loop would delay both. */
     /* USER CODE BEGIN 3 */
 	  MX_LWIP_Process();
     ping_poll();
 
+    /* Handle the command decoded by the UART interrupt. Doing the work here and not
+     * in the interrupt keeps the interrupt short and never calls lwIP from it. */
     if(LED_command == flag_ON){
     		HAL_UART_Transmit(&huart3,message_Flag_ON, sizeof(message_Flag_ON)-1,10);
-        // ping_send(host);
-    		ping_start();
+    		ping_start();  /* board starts pinging the PC */
     		LED_command = flag_Idle;
     }
     else if (LED_command == flag_OFF){
-//    		HAL_UART_Transmit(&huart3,message_Flag_OFF, sizeof(message_Flag_OFF)-1,10);
+    /* DMA transmit: returns at once, the hardware sends the bytes in the background. */
 		status = HAL_UART_Transmit_DMA(&huart3,message_dma, sizeof(message_dma)-1);
-    ping_stop();
+    ping_stop(); /* board stops pinging */
 		   if (status == HAL_ERROR) {
 			  Error_Handler();
 		  }
@@ -367,25 +379,25 @@ void UART_DMATransmitCplt(DMA_HandleTypeDef *hdma){
 	HAL_GPIO_TogglePin(GPIOB,LD2_Pin);
 }
 
+/* Called by HAL (interrupt/DMA context) when an interrupt or DMA UART transmit
+ * finishes. Toggles LD3 as a visual "transmission done" indicator. */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
 	HAL_GPIO_TogglePin(GPIOB,LD3_Pin);
 }
+
+/* Called by HAL from the UART RX interrupt after each received byte.
+ * Runs in interrupt context: only set the LED, store the command and re-arm
+ * the reception. Anything slow or lwIP-related is left to the main loop. */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 	HAL_StatusTypeDef rstatus;
-//	rx_message[6] = '\0';
-//	HAL_GPIO_WritePin(GPIOB,LD1_Pin,GPIO_PIN_SET);
-//	HAL_UART_Transmit_IT(&huart3, rx_message, 1);
 	if(*rx_message == '1'){
 		HAL_GPIO_WritePin(GPIOB,LD1_Pin,GPIO_PIN_SET);
 		LED_command = flag_ON;
-//		flag_ON = true;
   } else if (*rx_message == '0') {
 		HAL_GPIO_WritePin(GPIOB,LD1_Pin,GPIO_PIN_RESET);
 		LED_command = flag_OFF;
-//		flag_ON = false;
   } else{
 	  LED_command = flag_ERROR;
-//	  flag_ERROR = true;
   }
   rstatus = HAL_UART_Receive_IT(&huart3, rx_message,1);
   if (rstatus == HAL_ERROR) {
